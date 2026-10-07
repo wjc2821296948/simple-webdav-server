@@ -1,8 +1,7 @@
 {
   "name": "@wjc2821296948/simple-webdav-server",
-  "version": "1.1.0",
-  "description": "An simple webdav server.",
-  "type": "module",
+  "version": "0.1.0",
+  "description": "A lightweight config-driven WebDAV server for small deployments.",
   "license": "Apache-2.0",
   "author": "wjc2821296948",
   "repository": {
@@ -14,26 +13,16 @@
     "url": "https://github.com/wjc2821296948/simple-webdav-server/issues"
   },
   "files": [
-    "index.html",
-    "styles.css",
-    "panel.png",
-    "src/",
+    "simple_webdav/",
     "README.md",
-    "README.en.md",
     "LICENSE",
-    "bin/"
+    "pyproject.toml",
+    "requirements.txt",
+    "Dockerfile",
+    "docker-compose.yml",
+    "config.example.yaml"
   ],
-  "bin": {
-    "xmrig-proxy-dashboard": "bin/server.js"
-  },
-  "scripts": {
-    "start": "xmrig-proxy-dashboard",
-    "serve": "xmrig-proxy-dashboard"
-  },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }
