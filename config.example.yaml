@@ -1,6 +1,7 @@
 host: 0.0.0.0
 port: 8080
 
+# Inside Docker, keep this as /data and mount your storage there.
 data_root: /data
 
 users:
@@ -27,15 +28,8 @@ verbose: 3
 dir_browser:
   enable: true
 
+# Basic auth is intended to run behind HTTPS.
 http_authenticator:
   accept_basic: true
   accept_digest: false
   default_to_digest: false
-  domain_controller: simple_webdav.auth.ConfigDomainController
-
-provider_mapping:
-  "/":
-    class: simple_webdav.provider.UserFilesystemProvider
-    kwargs:
-      data_root: /data
-      users: "${USERS}"
