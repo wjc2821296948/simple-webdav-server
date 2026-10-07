@@ -1,0 +1,4 @@
+WsgiDAV>=4.3,<5
+cheroot>=11,<12
+PyYAML>=6,<7
+bcrypt>=4,<6

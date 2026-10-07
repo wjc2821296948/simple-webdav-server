@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-webdav-server"
+version = "0.1.0"
+description = "A lightweight config-driven WebDAV server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "WsgiDAV>=4.3,<5",
+  "cheroot>=11,<12",
+  "PyYAML>=6,<7",
+  "bcrypt>=4,<6",
+]
+
+[project.scripts]
+simple-webdav-server = "simple_webdav.app:main"
+
+[tool.setuptools.packages.find]
+include = ["simple_webdav*"]

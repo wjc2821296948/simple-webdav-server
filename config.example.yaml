@@ -1,0 +1,41 @@
+host: 0.0.0.0
+port: 8080
+
+data_root: /data
+
+users:
+  display:
+    root: display
+    readonly: true
+    quota: 5GiB
+    password_hash: "$2b$12$REPLACE_ME"
+
+  math:
+    root: math
+    readonly: false
+    quota: 2GiB
+    password_hash: "$2b$12$REPLACE_ME"
+
+  chinese:
+    root: chinese
+    readonly: false
+    quota: 2GiB
+    password_hash: "$2b$12$REPLACE_ME"
+
+verbose: 3
+
+dir_browser:
+  enable: true
+
+http_authenticator:
+  accept_basic: true
+  accept_digest: false
+  default_to_digest: false
+  domain_controller: simple_webdav.auth.ConfigDomainController
+
+provider_mapping:
+  "/":
+    class: simple_webdav.provider.UserFilesystemProvider
+    kwargs:
+      data_root: /data
+      users: "${USERS}"
