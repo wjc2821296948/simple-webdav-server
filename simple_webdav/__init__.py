@@ -1,0 +1,1 @@
+"""Simple WebDAV Server package."""
