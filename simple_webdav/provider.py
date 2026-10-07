@@ -226,6 +226,21 @@ class UserFolderResource(FolderResource):
     def create_empty_resource(self, name):
         if self._user_config()["readonly"]:
             raise DAVError(HTTP_FORBIDDEN)
+
+        content_length = self.environ.get("CONTENT_LENGTH")
+        if content_length in (None, ""):
+            raise DAVError(
+                HTTP_LENGTH_REQUIRED,
+                "PUT requests must include Content-Length for quota enforcement",
+            )
+
+        try:
+            incoming_size = int(content_length)
+        except ValueError as exc:
+            raise DAVError(HTTP_LENGTH_REQUIRED, "Invalid Content-Length") from exc
+
+        new_path = f"{self.path.rstrip('/')}/{name}"
+        self.provider.check_quota(self.environ, new_path, incoming_size)
         return super().create_empty_resource(name)
 
     def create_collection(self, name):
