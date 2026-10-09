@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 
 from wsgidav import util
@@ -48,6 +49,8 @@ def parse_size(value) -> int | None:
 class UserFilesystemProvider(FilesystemProvider):
     """One WebDAV root that is dynamically chrooted per authenticated user."""
 
+    USAGE_CACHE_TTL_SECONDS = 2.0
+
     def __init__(self, data_root: str, users: dict):
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
@@ -81,6 +84,7 @@ class UserFilesystemProvider(FilesystemProvider):
         self._quota_locks = {
             username: threading.RLock() for username in self.users
         }
+        self._usage_cache = {}
 
     def _get_user(self, environ):
         username = environ.get("wsgidav.auth.user_name")
@@ -117,8 +121,8 @@ class UserFilesystemProvider(FilesystemProvider):
 
         return util.to_unicode_safe(file_path)
 
-    def used_bytes(self, environ):
-        root = self._user_root(environ)
+    def _scan_used_bytes(self, username):
+        root = self.users[username]["root"]
         total = 0
         for current_root, dirs, files in os.walk(root, followlinks=False):
             dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current_root, d))]
@@ -131,6 +135,24 @@ class UserFilesystemProvider(FilesystemProvider):
                 except FileNotFoundError:
                     continue
         return total
+
+    def used_bytes(self, environ):
+        """Return cached per-user usage, rescanning at most every two seconds."""
+        username = self._get_user(environ)
+        with self._quota_locks[username]:
+            now = time.monotonic()
+            cached = self._usage_cache.get(username)
+            if cached is not None and now - cached[0] < self.USAGE_CACHE_TTL_SECONDS:
+                return cached[1]
+
+            total = self._scan_used_bytes(username)
+            self._usage_cache[username] = (time.monotonic(), total)
+            return total
+
+    def invalidate_usage(self, username):
+        """Invalidate one user's cached usage after a successful mutation."""
+        with self._quota_locks[username]:
+            self._usage_cache.pop(username, None)
 
     def check_quota(self, environ, path: str, incoming_size: int):
         quota = self._user_config(environ)["quota"]
@@ -190,7 +212,9 @@ class UserFileResource(FileResource):
     def delete(self):
         if self._user_config()["readonly"]:
             raise DAVError(HTTP_FORBIDDEN)
-        return super().delete()
+        result = super().delete()
+        self.provider.invalidate_usage(self.provider._get_user(self.environ))
+        return result
 
     def copy_move_single(self, dest_path, *, is_move):
         if self._user_config()["readonly"]:
@@ -207,7 +231,9 @@ class UserFileResource(FileResource):
                     if used - old_dest_size + source_size > quota:
                         raise DAVError(507, "Quota exceeded by COPY")
 
-        return super().copy_move_single(dest_path, is_move=is_move)
+        result = super().copy_move_single(dest_path, is_move=is_move)
+        self.provider.invalidate_usage(self.provider._get_user(self.environ))
+        return result
 
 
 class UserFolderResource(FolderResource):
@@ -251,7 +277,9 @@ class UserFolderResource(FolderResource):
     def delete(self):
         if self._user_config()["readonly"]:
             raise DAVError(HTTP_FORBIDDEN)
-        return super().delete()
+        result = super().delete()
+        self.provider.invalidate_usage(self.provider._get_user(self.environ))
+        return result
 
     def copy_move_single(self, dest_path, *, is_move):
         if self._user_config()["readonly"]:
@@ -263,9 +291,13 @@ class UserFolderResource(FolderResource):
                 405,
                 "Directory COPY is not implemented in the first version",
             )
-        return super().copy_move_single(dest_path, is_move=is_move)
+        result = super().copy_move_single(dest_path, is_move=is_move)
+        self.provider.invalidate_usage(self.provider._get_user(self.environ))
+        return result
 
     def move_recursive(self, dest_path):
         if self._user_config()["readonly"]:
             raise DAVError(HTTP_FORBIDDEN)
-        return super().move_recursive(dest_path)
+        result = super().move_recursive(dest_path)
+        self.provider.invalidate_usage(self.provider._get_user(self.environ))
+        return result
