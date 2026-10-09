@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import threading
+import uuid
 from pathlib import Path
 
 from wsgidav import util
-from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_LENGTH_REQUIRED
+from wsgidav.dav_error import (
+    DAVError,
+    HTTP_BAD_REQUEST,
+    HTTP_FORBIDDEN,
+    HTTP_LENGTH_REQUIRED,
+)
 from wsgidav.fs_dav_provider import (
     BUFFER_SIZE,
     FileResource,
@@ -81,6 +88,7 @@ class UserFilesystemProvider(FilesystemProvider):
         self._quota_locks = {
             username: threading.RLock() for username in self.users
         }
+        self._upload_reservations = {username: {} for username in self.users}
 
     def _get_user(self, environ):
         username = environ.get("wsgidav.auth.user_name")
@@ -149,6 +157,88 @@ class UserFilesystemProvider(FilesystemProvider):
                     f"Quota exceeded: {projected} > {quota} bytes",
                 )
 
+    def reserve_upload(self, environ, path: str, incoming_size: int):
+        """Reserve quota growth until this upload either commits or aborts."""
+        username = self._get_user(environ)
+        if incoming_size < 0:
+            raise DAVError(HTTP_BAD_REQUEST, "Invalid Content-Length")
+
+        current_path = self._loc_to_file_path(path, environ)
+        lock = self._quota_locks[username]
+        with lock:
+            existing_size = (
+                os.path.getsize(current_path)
+                if os.path.isfile(current_path)
+                else 0
+            )
+            growth = max(0, incoming_size - existing_size)
+            quota = self.users[username]["quota"]
+            used = self.used_bytes(environ)
+            reserved = sum(self._upload_reservations[username].values())
+            projected = used + reserved + growth
+            if quota is not None and projected > quota:
+                raise DAVError(
+                    507,
+                    f"Quota exceeded: {projected} > {quota} bytes",
+                )
+
+            reservation_id = uuid.uuid4().hex
+            self._upload_reservations[username][reservation_id] = growth
+            return reservation_id
+
+    def release_upload_reservation(self, username, reservation_id):
+        if reservation_id is None:
+            return
+        with self._quota_locks[username]:
+            self._upload_reservations[username].pop(reservation_id, None)
+
+    def complete_upload(
+        self,
+        environ,
+        reservation_id,
+        temp_path: str,
+        target_path: str,
+        expected_size: int,
+        actual_size: int,
+    ):
+        """Atomically publish a complete upload and release its reservation."""
+        username = self._get_user(environ)
+        with self._quota_locks[username]:
+            try:
+                file_size = os.path.getsize(temp_path)
+                if actual_size != expected_size or file_size != expected_size:
+                    raise DAVError(
+                        HTTP_BAD_REQUEST,
+                        "Upload length did not match Content-Length",
+                    )
+
+                os.replace(temp_path, target_path)
+                # Keep this provider compatible with the separate quota-cache
+                # change; it is available when that pull request is merged.
+                invalidate = getattr(self, "invalidate_usage", None)
+                if invalidate is not None:
+                    invalidate(username)
+            finally:
+                if reservation_id is not None:
+                    self._upload_reservations[username].pop(reservation_id, None)
+
+    def create_upload_temp(self, target_path: str):
+        """Create a hidden temporary file beside the destination for os.replace."""
+        parent = os.path.dirname(target_path)
+        for _ in range(5):
+            temp_path = os.path.join(
+                parent, f".simple-webdav-upload-{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+            except FileExistsError:
+                continue
+            os.close(fd)
+            if os.path.isfile(target_path):
+                os.chmod(temp_path, stat.S_IMODE(os.stat(target_path).st_mode))
+            return temp_path
+        raise OSError("Could not allocate a unique WebDAV upload temporary file")
+
     def get_resource_inst(self, path: str, environ: dict):
         self._count_get_resource_inst += 1
         fp = self._loc_to_file_path(path, environ)
@@ -163,7 +253,56 @@ class UserFilesystemProvider(FilesystemProvider):
         return UserFileResource(path, environ, fp)
 
 
+class _AtomicUploadWriter:
+    """Count an upload stream and fsync it before allowing publication."""
+
+    def __init__(self, fileobj):
+        self._fileobj = fileobj
+        self.bytes_written = 0
+        self.closed = False
+
+    def write(self, data):
+        written = self._fileobj.write(data)
+        self.bytes_written += written or 0
+        return written
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            self._fileobj.flush()
+            os.fsync(self._fileobj.fileno())
+        finally:
+            self._fileobj.close()
+            self.closed = True
+
+    def abort(self):
+        if not self.closed:
+            try:
+                try:
+                    self._fileobj.close()
+                except OSError:
+                    # The target is still untouched; cleanup must continue.
+                    pass
+            finally:
+                self.closed = True
+
+
 class UserFileResource(FileResource):
+    def __init__(self, path, environ, file_path, *, target_path=None, new_upload=False):
+        super().__init__(path, environ, file_path)
+        self._target_path = target_path or file_path
+        self._upload_temp_path = file_path if new_upload else None
+        self._upload_reservation_id = None
+        self._upload_expected_size = None
+        self._upload_target_path = self._target_path
+        self._upload_writer = None
+        self.name = util.to_str(os.path.basename(self._target_path))
+
     def _user_config(self):
         return self.provider._user_config(self.environ)
 
@@ -184,8 +323,92 @@ class UserFileResource(FileResource):
         except ValueError as exc:
             raise DAVError(HTTP_LENGTH_REQUIRED, "Invalid Content-Length") from exc
 
-        self.provider.check_quota(self.environ, self.path, incoming_size)
-        return open(self._file_path, "wb", BUFFER_SIZE)
+        target_path = self.provider._loc_to_file_path(self.path, self.environ)
+        reservation_id = None
+        temp_path = self._upload_temp_path
+        try:
+            reservation_id = self.provider.reserve_upload(
+                self.environ, self.path, incoming_size
+            )
+            if temp_path is None:
+                temp_path = self.provider.create_upload_temp(target_path)
+
+            self._upload_temp_path = temp_path
+            self._upload_target_path = target_path
+            self._upload_reservation_id = reservation_id
+            self._upload_expected_size = incoming_size
+            self._upload_writer = _AtomicUploadWriter(
+                open(temp_path, "wb", BUFFER_SIZE)
+            )
+            return self._upload_writer
+        except Exception:
+            self.provider.release_upload_reservation(
+                self.provider._get_user(self.environ), reservation_id
+            )
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+            self._reset_upload_state()
+            raise
+
+    def _reset_upload_state(self):
+        self._upload_temp_path = None
+        self._upload_reservation_id = None
+        self._upload_expected_size = None
+        self._upload_writer = None
+
+    def end_write(self, *, with_errors):
+        username = self.provider._get_user(self.environ)
+        temp_path = self._upload_temp_path
+        reservation_id = self._upload_reservation_id
+        writer = self._upload_writer
+
+        if with_errors:
+            if writer is not None:
+                writer.abort()
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+            self.provider.release_upload_reservation(username, reservation_id)
+            self._reset_upload_state()
+            return super().end_write(with_errors=True)
+
+        try:
+            if writer is None or temp_path is None:
+                raise DAVError(HTTP_BAD_REQUEST, "Upload was not initialized")
+            if not writer.closed:
+                writer.close()
+
+            target_path = self._upload_target_path
+            self.provider.complete_upload(
+                self.environ,
+                reservation_id,
+                temp_path,
+                target_path,
+                self._upload_expected_size,
+                writer.bytes_written,
+            )
+            self._file_path = target_path
+            self.file_stat = os.stat(target_path)
+            self.name = util.to_str(os.path.basename(target_path))
+        except Exception:
+            if writer is not None:
+                writer.abort()
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+            self.provider.release_upload_reservation(username, reservation_id)
+            raise
+        finally:
+            self._reset_upload_state()
+
+        return super().end_write(with_errors=False)
 
     def delete(self):
         if self._user_config()["readonly"]:
@@ -217,6 +440,14 @@ class UserFolderResource(FolderResource):
     def get_used_bytes(self):
         return self.provider.used_bytes(self.environ)
 
+    def get_member_names(self):
+        # Temporary uploads are implementation details, not WebDAV resources.
+        return [
+            name
+            for name in super().get_member_names()
+            if not name.startswith(".simple-webdav-upload-")
+        ]
+
     def get_available_bytes(self):
         quota = self._user_config()["quota"]
         if quota is None:
@@ -240,8 +471,22 @@ class UserFolderResource(FolderResource):
             raise DAVError(HTTP_LENGTH_REQUIRED, "Invalid Content-Length") from exc
 
         new_path = f"{self.path.rstrip('/')}/{name}"
-        self.provider.check_quota(self.environ, new_path, incoming_size)
-        return super().create_empty_resource(name)
+        target_path = self.provider._loc_to_file_path(new_path, self.environ)
+        temp_path = self.provider.create_upload_temp(target_path)
+        try:
+            return UserFileResource(
+                new_path,
+                self.environ,
+                temp_path,
+                target_path=target_path,
+                new_upload=True,
+            )
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     def create_collection(self, name):
         if self._user_config()["readonly"]:
